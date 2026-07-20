@@ -574,8 +574,20 @@ async function syncObra(obra) {
   if (!res.ok) throw new Error('HTTP ' + res.status);
   const text = await res.text();
   if (text.trim().startsWith('<')) throw new Error('Sheet no p\u00fablico o pesta\u00f1a "' + obra.sheetTab + '" incorrecta');
-  ST.pagos[obra.id] = parseCSV(text);
+
+  const { pagos, presupTotal, sedesFromSheet } = parseCSV(text);
+  ST.pagos[obra.id] = pagos;
   ST.synced[obra.id] = new Date();
+
+  // Actualizar presupuesto total desde el Sheet si está disponible
+  if (presupTotal && presupTotal > 0) {
+    obra.presupuesto.total = presupTotal;
+    obra.presupuesto.base  = presupTotal / 1.12;
+  }
+  // Actualizar sedes desde el Sheet si encontramos datos
+  if (sedesFromSheet.length > 0) {
+    obra.presupuesto.sedes = sedesFromSheet;
+  }
 }
 
 async function syncAll() {
@@ -631,27 +643,68 @@ function parseCSV(text) {
     let [,d,mo,y] = m; if (y.length===2) y='20'+y;
     return y+'-'+mo.padStart(2,'0')+'-'+d.padStart(2,'0');
   }
-  function monto(raw) {
+  function parseMonto(raw) {
     if (!raw) return NaN;
     let s = raw.replace(/[$\s"]/g,'');
     if (/\.\d{3}[,\.]/.test(s)||/\.\d{3}$/.test(s)) s=s.replace(/\./g,'').replace(',','.');
     else s=s.replace(',','.');
     return parseFloat(s);
   }
-  const skip = ['descripci','sede','total presup','dif en','honorario proyecto','presupuesto original'];
-  return text.split('\n').flatMap(line => {
-    if (!line.trim()) return [];
+
+  const lines = text.split('\n');
+  const pagos = [];
+  // Datos de presupuesto extraídos del encabezado del Sheet
+  let presupTotal = null;
+  const sedesFromSheet = [];
+
+  // Etiquetas de sedes conocidas (col A) — buscar en filas del encabezado
+  const sedeNames = ['core indoor','pilates','yoga','funcional','crossfit','spinning'];
+  const sedeColors = ['#FF5C33','#474747','#9DA5A8','#2EA87A','#E8A020','#D04040'];
+
+  const skipPago = ['descripci','total presup','dif en','honorario proyecto','presupuesto original','total costo','dif con'];
+
+  lines.forEach(line => {
+    if (!line.trim()) return;
     const c = row(line);
-    const desc = (c[0]||'').trim(); if (!desc) return [];
-    if (skip.some(k => desc.toLowerCase().includes(k))) return [];
-    const f = fecha((c[4]||'').trim()); if (!f) return [];
-    const m = monto((c[7]||'').trim()); if (isNaN(m)||m<=0) return [];
+    const colA = (c[0]||'').trim().toLowerCase();
+    const colE = (c[4]||'').trim().toLowerCase();
+    const colF = (c[5]||'').trim();
+
+    // ── Leer presupuesto total desde encabezado ──
+    // Busca "TOTAL PRESUPUESTO EN PESOS" en col E → valor en col F
+    if (colE.includes('total presupuesto en pesos') || colE.includes('total presupuesto')) {
+      const v = parseMonto(colF);
+      if (!isNaN(v) && v > 0) presupTotal = v;
+    }
+
+    // ── Leer sedes desde encabezado (filas 8-10 aprox) ──
+    // Col A = nombre sede, Col F = total sede
+    const matchedSede = sedeNames.findIndex(s => colA.startsWith(s) || colA.includes(s));
+    if (matchedSede !== -1 && !colA.includes('descripci') && !colA.includes('presup')) {
+      const t = parseMonto(colF);
+      const colH = (c[7]||'').trim();
+      const t2 = parseMonto(colH);
+      const total = (!isNaN(t) && t > 0) ? t : (!isNaN(t2) && t2 > 0) ? t2 : null;
+      if (total) {
+        const nominalName = (c[0]||'').trim();
+        if (!sedesFromSheet.find(s => s.n === nominalName))
+          sedesFromSheet.push({ n: nominalName, t: total, c: sedeColors[matchedSede % sedeColors.length] });
+      }
+    }
+
+    // ── Leer pagos (filas desde la 22+) ──
+    const desc = (c[0]||'').trim(); if (!desc) return;
+    if (skipPago.some(k => desc.toLowerCase().includes(k))) return;
+    const f = fecha((c[4]||'').trim()); if (!f) return;
+    const m = parseMonto((c[7]||'').trim()); if (isNaN(m)||m<=0) return;
     const ndoc = (c[3]||'').trim();
     const estado = (c[8]||'').toLowerCase().includes('pagado') ? 'Pagado' : 'Pendiente';
     const tipo   = ndoc.toLowerCase().includes('recibo') ? 'Recibo' : 'Factura';
     const cert   = desc.toLowerCase().includes('certificado') || desc.toLowerCase().includes('adelanto') || tipo==='Recibo';
-    return [{ desc, tipo, ndoc, fecha: f, razon: (c[5]||'').trim(), monto: m, estado, cert }];
+    pagos.push({ desc, tipo, ndoc, fecha: f, razon: (c[5]||'').trim(), monto: m, estado, cert });
   });
+
+  return { pagos, presupTotal, sedesFromSheet };
 }
 
 // ═══════════════════════════════════════════════════════
@@ -987,62 +1040,126 @@ function calcProyeccion(obraId) {
 // ═══════════════════════════════════════════════════════
 // PLANOS — con carga de archivos desde el dashboard
 // ═══════════════════════════════════════════════════════
+function savePlanosToStorage(obraId) {
+  try {
+    const obra = getObra(obraId); if (!obra) return;
+    const userPlanos = obra.planos.filter(p => p.id.startsWith('plano_'));
+    localStorage.setItem('core_planos_' + obraId, JSON.stringify(userPlanos));
+  } catch(e) { console.warn('localStorage:', e.message); }
+}
+
+function loadPlanosFromStorage(obraId) {
+  try {
+    const raw = localStorage.getItem('core_planos_' + obraId);
+    return raw ? JSON.parse(raw) : [];
+  } catch(e) { return []; }
+}
+
+function initPlanosFromStorage() {
+  OBRAS.forEach(obra => {
+    const saved = loadPlanosFromStorage(obra.id);
+    saved.forEach(p => {
+      if (!obra.planos.find(x => x.id === p.id)) obra.planos.push(p);
+    });
+  });
+}
+
 function renderPlanos(obra) {
   const tabsEl=$('d-plano-tabs'), bodyEl=$('d-plano-body');
   $('plano-file-input').dataset.obraId = obra.id;
 
-  if (!obra.planos||!obra.planos.length) {
-    tabsEl.innerHTML='';
-    bodyEl.innerHTML='<div class="empty-st"><div class="icon">&#128272;</div><p>No hay planos cargados para esta obra.<br><span style="font-size:11px;color:var(--or);cursor:pointer;font-weight:700" onclick="document.getElementById(\'plano-file-input\').click()">+ Cargar plano (PDF o imagen)</span></p></div>';
+  if (!obra.planos || !obra.planos.length) {
+    tabsEl.innerHTML = '';
+    bodyEl.innerHTML = '<div class="empty-st"><div class="icon">&#128272;</div><p>No hay planos cargados para esta obra.<br>'
+      + '<span style="font-size:11px;color:var(--or);cursor:pointer;font-weight:700" '
+      + 'onclick="document.getElementById(\'plano-file-input\').click()">+ Cargar plano (PDF o imagen)</span></p></div>';
     return;
   }
-  tabsEl.innerHTML='';
-  obra.planos.forEach((p,i)=>{
-    const btn=document.createElement('button');
-    btn.className='plano-tab'+(i===0?' active':'');
-    btn.textContent=p.label;
-    btn.addEventListener('click',()=>{
-      document.querySelectorAll('.plano-tab').forEach(b=>b.classList.remove('active'));
+
+  tabsEl.innerHTML = '';
+  let activeIdx = 0;
+
+  obra.planos.forEach((p, i) => {
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'display:inline-flex;align-items:center;gap:0;margin-right:4px';
+
+    const btn = document.createElement('button');
+    btn.className = 'plano-tab' + (i === 0 ? ' active' : '');
+    btn.textContent = p.label;
+    btn.dataset.idx = i;
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.plano-tab').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       showPlano(p);
     });
-    tabsEl.appendChild(btn);
+    wrap.appendChild(btn);
+
+    // Botón eliminar solo para planos cargados por usuario
+    if (p.id.startsWith('plano_')) {
+      const del = document.createElement('button');
+      del.innerHTML = '&times;';
+      del.title = 'Eliminar este plano';
+      del.style.cssText = 'background:rgba(208,64,64,.08);border:1px solid rgba(208,64,64,.2);'
+        + 'border-left:none;color:var(--err);cursor:pointer;padding:5px 8px;font-size:13px;'
+        + 'border-radius:0 var(--r) var(--r) 0;line-height:1;font-family:inherit;transition:all .15s';
+      del.addEventListener('mouseenter', () => del.style.background = 'rgba(208,64,64,.2)');
+      del.addEventListener('mouseleave', () => del.style.background = 'rgba(208,64,64,.08)');
+      del.addEventListener('click', e => {
+        e.stopPropagation();
+        if (!confirm('\u00bfEliminar el plano "' + p.label + '"?')) return;
+        obra.planos = obra.planos.filter(x => x.id !== p.id);
+        savePlanosToStorage(obra.id);
+        showToast('Plano eliminado');
+        renderPlanos(obra);
+      });
+      wrap.appendChild(del);
+    }
+
+    tabsEl.appendChild(wrap);
   });
+
   showPlano(obra.planos[0]);
 }
 
 function showPlano(plano) {
-  const bodyEl=$('d-plano-body');
+  const bodyEl = $('d-plano-body');
+  if (!plano || !plano.data) {
+    bodyEl.innerHTML = '<div class="empty-st"><div class="icon">&#128272;</div><p>Error al cargar el plano.</p></div>';
+    return;
+  }
   if (plano.data.startsWith('data:image')) {
-    bodyEl.innerHTML='<img src="'+plano.data+'" style="width:100%;border-radius:var(--r);max-height:600px;object-fit:contain;background:#f5f5f5">';
+    bodyEl.innerHTML = '<img src="' + plano.data + '" style="width:100%;border-radius:var(--r);max-height:600px;object-fit:contain;background:#f5f5f5">';
   } else {
-    bodyEl.innerHTML='<iframe class="plano-embed" src="'+plano.data+'#toolbar=0&navpanes=0" title="'+plano.label+'"></iframe>'
-      +'<div class="plano-legend">'
-      +'<div class="plano-legend-item"><div class="plano-dot" style="background:#FF5C33"></div>Mamposter\u00eda nueva ladrillo BEL 12</div>'
-      +'<div class="plano-legend-item"><div class="plano-dot" style="background:#4CAF50"></div>Tabliquer\u00eda de durlock</div>'
-      +'<div class="plano-legend-item"><div class="plano-dot" style="background:#FF9800"></div>Cielorraso de durlock nuevo</div>'
-      +'<div class="plano-legend-item"><div class="plano-dot" style="background:#9E9E9E"></div>Mamposter\u00eda existente</div>'
-      +'</div>';
+    bodyEl.innerHTML = '<iframe class="plano-embed" src="' + plano.data + '#toolbar=0&navpanes=0" title="' + plano.label + '"></iframe>'
+      + '<div class="plano-legend">'
+      + '<div class="plano-legend-item"><div class="plano-dot" style="background:#FF5C33"></div>Mamposter\u00eda nueva ladrillo BEL 12</div>'
+      + '<div class="plano-legend-item"><div class="plano-dot" style="background:#4CAF50"></div>Tabliquer\u00eda de durlock</div>'
+      + '<div class="plano-legend-item"><div class="plano-dot" style="background:#FF9800"></div>Cielorraso de durlock nuevo</div>'
+      + '<div class="plano-legend-item"><div class="plano-dot" style="background:#9E9E9E"></div>Mamposter\u00eda existente</div>'
+      + '</div>';
   }
 }
 
 function onPlanoFileSelected(event) {
   const file = event.target.files[0]; if (!file) return;
   const obraId = event.target.dataset.obraId;
-  const obra   = getObra(obraId); if (!obra) return;
+  const obra = getObra(obraId); if (!obra) return;
   const reader = new FileReader();
   reader.onload = e => {
-    const label = file.name.replace(/\.[^.]+$/,'');
+    const label = file.name.replace(/\.[^.]+$/, '');
     const planoId = 'plano_' + Date.now();
     obra.planos.push({ label, id: planoId, data: e.target.result });
-    showToast('\u2713 Plano "' + label + '" cargado');
+    savePlanosToStorage(obraId);
+    showToast('\u2713 Plano "' + label + '" guardado \u2014 queda guardado en este dispositivo');
     renderPlanos(obra);
-    // Activar el tab del nuevo plano
-    const tabs = document.querySelectorAll('.plano-tab');
-    if (tabs.length) tabs[tabs.length-1].click();
+    // Activar el tab del nuevo plano recién agregado
+    setTimeout(() => {
+      const tabs = document.querySelectorAll('.plano-tab');
+      if (tabs.length) tabs[tabs.length - 1].click();
+    }, 100);
   };
   reader.readAsDataURL(file);
-  event.target.value = ''; // reset para permitir cargar el mismo archivo de nuevo
+  event.target.value = '';
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1151,6 +1268,7 @@ function exportCSVAll() {
 // ═══════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', () => {
   $('hfecha').textContent = new Date().toLocaleDateString('es-AR');
+  initPlanosFromStorage();  // restaurar planos guardados
   renderPanel();
   setTimeout(syncAll, 300);
 });
