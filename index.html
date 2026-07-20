@@ -1127,18 +1127,90 @@ function showPlano(plano) {
     bodyEl.innerHTML = '<div class="empty-st"><div class="icon">&#128272;</div><p>Error al cargar el plano.</p></div>';
     return;
   }
+
+  const legend = '<div class="plano-legend">'
+    + '<div class="plano-legend-item"><div class="plano-dot" style="background:#FF5C33"></div>Mamposter\u00eda nueva ladrillo BEL 12</div>'
+    + '<div class="plano-legend-item"><div class="plano-dot" style="background:#4CAF50"></div>Tabliquer\u00eda de durlock</div>'
+    + '<div class="plano-legend-item"><div class="plano-dot" style="background:#FF9800"></div>Cielorraso de durlock nuevo</div>'
+    + '<div class="plano-legend-item"><div class="plano-dot" style="background:#9E9E9E"></div>Mamposter\u00eda existente</div>'
+    + '</div>';
+
   if (plano.data.startsWith('data:image')) {
-    bodyEl.innerHTML = '<img src="' + plano.data + '" style="width:100%;border-radius:var(--r);max-height:600px;object-fit:contain;background:#f5f5f5">';
+    // Imagen: mostrar directamente
+    bodyEl.innerHTML = '<img src="' + plano.data + '" style="width:100%;border-radius:var(--r);max-height:640px;object-fit:contain;background:#f5f5f5;display:block">' + legend;
+    return;
+  }
+
+  // PDF: intentar con <object>, con fallback a descarga
+  // Renderizar con canvas usando pdf.js CDN para máxima compatibilidad
+  bodyEl.innerHTML =
+    '<div id="pdf-canvas-wrap" style="width:100%;background:#525659;border-radius:var(--r);overflow-y:auto;max-height:640px;text-align:center;padding:1rem">'
+    + '<canvas id="pdf-canvas" style="max-width:100%;box-shadow:0 2px 12px rgba(0,0,0,.4)"></canvas>'
+    + '</div>'
+    + '<div style="display:flex;align-items:center;justify-content:space-between;margin-top:.5rem;flex-wrap:wrap;gap:.5rem">'
+    + '<div style="display:flex;gap:.4rem;align-items:center">'
+    + '<button onclick="pdfPrevPage()" style="padding:4px 10px;border:1px solid var(--lt);border-radius:var(--r);background:var(--bg);cursor:pointer;font-size:11px;font-family:inherit">&#8592; Ant.</button>'
+    + '<span id="pdf-page-info" style="font-size:11px;color:var(--st)">Cargando...</span>'
+    + '<button onclick="pdfNextPage()" style="padding:4px 10px;border:1px solid var(--lt);border-radius:var(--r);background:var(--bg);cursor:pointer;font-size:11px;font-family:inherit">Sig. &#8594;</button>'
+    + '</div>'
+    + '<a href="' + plano.data + '" download="' + (plano.label||'plano') + '.pdf" style="font-size:11px;color:var(--or);text-decoration:none;font-weight:700;border:1px solid rgba(255,92,51,.3);padding:4px 10px;border-radius:var(--r)">&#8595; Descargar PDF</a>'
+    + '</div>'
+    + legend;
+
+  renderPDFWithJS(plano.data);
+}
+
+// ── Renderizar PDF con pdf.js ──────────────────────────────────────────────
+let pdfDoc = null, pdfPage = 1, pdfRendering = false;
+
+function renderPDFWithJS(dataUrl) {
+  pdfPage = 1;
+  if (typeof pdfjsLib === 'undefined') {
+    // Cargar pdf.js dinámicamente si no está cargado
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+    script.onload = () => {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      loadPDF(dataUrl);
+    };
+    document.head.appendChild(script);
   } else {
-    bodyEl.innerHTML = '<iframe class="plano-embed" src="' + plano.data + '#toolbar=0&navpanes=0" title="' + plano.label + '"></iframe>'
-      + '<div class="plano-legend">'
-      + '<div class="plano-legend-item"><div class="plano-dot" style="background:#FF5C33"></div>Mamposter\u00eda nueva ladrillo BEL 12</div>'
-      + '<div class="plano-legend-item"><div class="plano-dot" style="background:#4CAF50"></div>Tabliquer\u00eda de durlock</div>'
-      + '<div class="plano-legend-item"><div class="plano-dot" style="background:#FF9800"></div>Cielorraso de durlock nuevo</div>'
-      + '<div class="plano-legend-item"><div class="plano-dot" style="background:#9E9E9E"></div>Mamposter\u00eda existente</div>'
-      + '</div>';
+    loadPDF(dataUrl);
   }
 }
+
+function loadPDF(dataUrl) {
+  pdfjsLib.getDocument(dataUrl).promise.then(pdf => {
+    pdfDoc = pdf;
+    set('pdf-page-info', 'Pág. 1 de ' + pdf.numPages);
+    renderPDFPage(1);
+  }).catch(e => {
+    const info = $('pdf-page-info');
+    if (info) info.textContent = 'Error al renderizar';
+    console.error('PDF error:', e);
+  });
+}
+
+function renderPDFPage(num) {
+  if (!pdfDoc || pdfRendering) return;
+  pdfRendering = true;
+  pdfDoc.getPage(num).then(page => {
+    const canvas = $('pdf-canvas'); if (!canvas) return;
+    const wrap   = $('pdf-canvas-wrap'); if (!wrap) return;
+    const scale  = Math.min((wrap.clientWidth - 32) / page.getViewport({scale:1}).width, 2.5);
+    const vp     = page.getViewport({scale});
+    canvas.width  = vp.width;
+    canvas.height = vp.height;
+    page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise.then(() => {
+      pdfRendering = false;
+      pdfPage = num;
+      set('pdf-page-info', 'P\u00e1g. ' + num + ' de ' + pdfDoc.numPages);
+    });
+  });
+}
+
+function pdfPrevPage() { if (pdfDoc && pdfPage > 1) renderPDFPage(pdfPage - 1); }
+function pdfNextPage() { if (pdfDoc && pdfPage < pdfDoc.numPages) renderPDFPage(pdfPage + 1); }
 
 function onPlanoFileSelected(event) {
   const file = event.target.files[0]; if (!file) return;
